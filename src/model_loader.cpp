@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdlib>
 #include <fstream>
@@ -1125,9 +1126,24 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         std::atomic<bool> failed(false);
         std::vector<std::thread> workers;
         std::mutex backend_tensor_set_mutex;
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
+        int n_done = 0;
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
+                struct DoneGuard {
+                    std::mutex& m;
+                    std::condition_variable& cv;
+                    int& n;
+                    ~DoneGuard() {
+                        {
+                            std::lock_guard<std::mutex> lock(m);
+                            ++n;
+                        }
+                        cv.notify_all();
+                    }
+                } done_guard{done_mutex, done_cv, n_done};
                 std::ifstream file;
                 zip_t* zip = nullptr;
                 if (is_zip) {
@@ -1350,7 +1366,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                       bytes_processed.load(),
                                       elapsed_seconds);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
+            const auto poll = std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200);
+            std::unique_lock<std::mutex> lock(done_mutex);
+            if (done_cv.wait_for(lock, poll, [&] { return n_done == n_threads; })) {
+                break;
+            }
         }
 
         for (auto& w : workers) {
