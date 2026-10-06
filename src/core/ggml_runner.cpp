@@ -759,7 +759,7 @@ bool GGMLRunner::fits(const std::vector<DeviceMemoryRequest>& requests,
     return true;
 }
 
-bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
+bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads, const std::function<void()>& while_running) {
     if (sd_backend_is_cpu(runtime_backend)) {
         sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
     }
@@ -773,11 +773,17 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
             LOG_WARN("%s: eval callback is not supported with the backend scheduler; ignoring", get_desc().c_str());
             multi_device_eval_callback_warned = true;
         }
-        status = ggml_backend_sched_graph_compute(scheduler, graph);
+        status = while_running ? ggml_backend_sched_graph_compute_async(scheduler, graph)
+                               : ggml_backend_sched_graph_compute(scheduler, graph);
+    } else if (while_running) {
+        status = ggml_backend_graph_compute_async(runtime_backend, graph);
     } else {
         status = sd_backend_graph_compute_with_eval_callback(runtime_backend, graph,
                                                              sd_get_backend_eval_callback(),
                                                              sd_get_backend_eval_callback_data());
+    }
+    if (status == GGML_STATUS_SUCCESS && while_running) {
+        while_running();
     }
     workspace_.synchronize();
     if (status != GGML_STATUS_SUCCESS) {
@@ -978,12 +984,20 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
         copy_data_to_backend_tensor(segment_graph, false);
         auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
-        if (!prefetch_requests.empty()) {
-            weights.enqueue_next(index, prefetch_requests.front());
+        auto prefetch = [&]() {
+            if (!prefetch_requests.empty()) {
+                weights.enqueue_next(index, prefetch_requests.front());
+            }
+        };
+        // Segmented stages read the next segment's weights while the submitted segment runs. A monolithic stage and an
+        // eval callback (synchronous compute) read them before the compute.
+        const bool overlap = segmented && sd_get_backend_eval_callback() == nullptr;
+        if (!overlap) {
+            prefetch();
         }
         LOG_DEBUG("%s executing segment %zu/%zu: %s", get_desc().c_str(),
                   index + 1, plan.segments.size(), segment.group_name.c_str());
-        if (!execute_segment(segment_graph, n_threads)) {
+        if (!execute_segment(segment_graph, n_threads, overlap ? std::function<void()>(prefetch) : std::function<void()>())) {
             return fail_segment("execution");
         }
         auto cache_status = cache_.capture(segment_graph);
