@@ -162,6 +162,13 @@ protected:
     sd::GraphCutTensorCache cut_cache_;
     sd::ComputeWorkspace workspace_;
     ggml_context* compute_ctx = nullptr;
+    // Memory of compute_ctx, kept until the runner is destroyed: a graph built again gets the same node addresses,
+    // which is what lets a backend recognise it (CUDA graphs key on nodes[0]).
+    struct alignas(64) ComputeCtxChunk {
+        unsigned char bytes[64];
+    };
+    std::unique_ptr<ComputeCtxChunk[]> compute_ctx_buffer_;
+    size_t compute_ctx_buffer_size_ = 0;
     bool runner_started_      = false;
     bool graph_active_        = false;
 

@@ -51,10 +51,18 @@ void GGMLRunner::free_params_ctx() {
 }
 
 void GGMLRunner::alloc_compute_ctx() {
+    GGML_ASSERT(compute_ctx == nullptr);
     ggml_init_params params;
     params.mem_size   = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
     params.mem_buffer = nullptr;
     params.no_alloc   = true;
+    // Uninitialised (default-init) memory: only the pages a graph actually touches are committed.
+    if (compute_ctx_buffer_ == nullptr || compute_ctx_buffer_size_ < params.mem_size) {
+        const size_t chunks      = (params.mem_size + sizeof(ComputeCtxChunk) - 1) / sizeof(ComputeCtxChunk);
+        compute_ctx_buffer_      = std::unique_ptr<ComputeCtxChunk[]>(new ComputeCtxChunk[chunks]);
+        compute_ctx_buffer_size_ = chunks * sizeof(ComputeCtxChunk);
+    }
+    params.mem_buffer = compute_ctx_buffer_.get();
 
     compute_ctx = ggml_init(params);
     GGML_ASSERT(compute_ctx != nullptr);
