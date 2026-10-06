@@ -751,7 +751,18 @@ namespace sd::ggml_graph_cut {
             }
         }
         for (int node_idx : segment.internal_node_indices) {
-            ggml_graph_add_node(segment_graph, ggml_graph_node(gf, node_idx));
+            ggml_tensor* node = ggml_graph_node(gf, node_idx);
+            ggml_graph_add_node(segment_graph, node);
+            // Backend op fusion (ggml_can_fuse) needs use counts, which ggml_graph_add_node does not record.
+            // Without them a segment runs unfused and rounds differently from monolithic execution, so results
+            // would depend on whether free memory forced segmentation. Cut outputs are flagged and stay unfused.
+            if (gf->use_counts != nullptr && segment_graph->use_counts != nullptr) {
+                const size_t src_pos = ggml_hash_find(&gf->visited_hash_set, node);
+                if (src_pos != GGML_HASHSET_FULL && ggml_bitset_get(gf->visited_hash_set.used, src_pos)) {
+                    const size_t dst_pos = ggml_hash_find_or_insert(&segment_graph->visited_hash_set, node);
+                    segment_graph->use_counts[dst_pos] = gf->use_counts[src_pos];
+                }
+            }
         }
         *graph_ctx_out = graph_ctx;
         return segment_graph;
