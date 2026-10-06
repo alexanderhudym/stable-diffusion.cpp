@@ -146,7 +146,8 @@ private:
                                                      size_t pending_cache_bytes) const;
     bool fits(const std::vector<DeviceMemoryRequest>& requests,
               const std::vector<ggml_tensor*>& params) const;
-    bool execute_segment(ggml_cgraph* graph, int n_threads);
+    // `while_running` runs on the host after the graph is submitted asynchronously and before it is synchronized
+    bool execute_segment(ggml_cgraph* graph, int n_threads, const std::function<void()>& while_running = {});
     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
 
 protected:
