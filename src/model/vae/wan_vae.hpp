@@ -366,9 +366,8 @@ namespace WAN {
             int64_t H = x->ne[1];
             int64_t W = x->ne[0];
 
-            auto x_ = x;
-            for (int64_t i = 1; i < repeats; i++) {
-                x = ggml_concat(ctx->ggml_ctx, x, x_, 2);
+            if (repeats > 1) {
+                x = ggml_repeat_4d(ctx->ggml_ctx, x, W, H, T * repeats, C);
             }
 
             C = out_channels;
