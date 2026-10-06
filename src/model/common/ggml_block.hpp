@@ -940,6 +940,27 @@ public:
         x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
         return x;
     }
+
+    // forward() followed by Rope::apply_rope(x, pe, interleaved) as one op (bit-identical), for x [D, heads, tokens, N];
+    // nullptr when the backend lacks it (only CUDA has it), the caller then builds both parts.
+    ggml_tensor* forward_rope_pe(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+#ifndef SD_USE_UPSTREAM_GGML
+        if (ctx->backend == nullptr || !ggml_is_contiguous(x) || x->type != GGML_TYPE_F32) {
+            return nullptr;
+        }
+        ggml_tensor* w = nullptr;
+        if (elementwise_affine) {
+            w = params["weight"];
+            if (ctx->weight_adapter) {
+                w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
+            }
+        }
+        auto out = ggml_rms_norm_rope_pe(ctx->ggml_ctx, x, w, pe, eps);
+        return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+#else
+        return nullptr;
+#endif
+    }
 };
 
 class MultiheadAttention : public GGMLBlock {

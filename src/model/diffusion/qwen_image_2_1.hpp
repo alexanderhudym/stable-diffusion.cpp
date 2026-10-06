@@ -186,10 +186,15 @@ namespace Qwen {
             auto q = project("to_q");
             auto k = project("to_k");
             auto v = project("to_v");
-            q      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"])->forward(ctx, q);
-            k      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"])->forward(ctx, k);
-            q      = Rope::apply_rope(ctx->ggml_ctx, q, pe);
-            k      = Rope::apply_rope(ctx->ggml_ctx, k, pe);
+            auto norm_rope = [&](const char* norm, ggml_tensor* t) {
+                auto block = std::dynamic_pointer_cast<RMSNorm>(blocks[norm]);
+                if (auto fused = block->forward_rope_pe(ctx, t, pe)) {
+                    return fused;
+                }
+                return Rope::apply_rope(ctx->ggml_ctx, block->forward(ctx, t), pe);
+            };
+            q = norm_rope("norm_q", q);
+            k = norm_rope("norm_k", k);
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -265,42 +270,50 @@ namespace Qwen {
             blocks["img_mlp.out"] = std::make_shared<Linear>(config.intermediate_size, config.hidden_size, false);
         }
 
-        static ggml_tensor* modulate(ggml_context* ctx, ggml_tensor* x, ggml_tensor* params, int64_t prefix_length, bool gate = false) {
-            auto rows  = ggml_ext_chunk(ctx, params, 2, 1);
-            auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
-                row = gate ? ggml_tanh(ctx, row) : ggml_scale_bias(ctx, row, 1.f, 1.f);
-                return ggml_mul(ctx, part, row);
-            };
-            auto target = apply(ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
-            if (prefix_length == 0) {
-                return target;
+        // the (1 + scale) or tanh(gate) rows of one modulation; they enter the graph before the tensor they multiply,
+        // so a NORM and its MUL end up adjacent (the CUDA backend fuses NORM -> MUL)
+        static std::vector<ggml_tensor*> mod_rows(GGMLRunnerContext* ctx, ggml_tensor* params, int64_t prefix_length, bool gate = false) {
+            auto rows = ggml_ext_chunk(ctx->ggml_ctx, params, 2, 1);
+            rows.resize(prefix_length == 0 ? 1 : 2);
+            for (auto& row : rows) {
+                row = gate ? ggml_tanh(ctx->ggml_ctx, row) : ggml_scale_bias(ctx->ggml_ctx, row, 1.f, 1.f);
+                ctx->expand_graph(row);
             }
-            auto prefix = apply(ggml_ext_slice(ctx, x, 1, 0, prefix_length), rows[1]);
+            return rows;
+        }
+
+        static ggml_tensor* modulate(ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& rows, int64_t prefix_length) {
+            if (prefix_length == 0) {
+                return ggml_mul(ctx, x, rows[0]);  // a slice of all of x would be a full copy
+            }
+            auto target = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, prefix_length, x->ne[1]), rows[0]);
+            auto prefix = ggml_mul(ctx, ggml_ext_slice(ctx, x, 1, 0, prefix_length), rows[1]);
             return ggml_concat(ctx, prefix, target, 1);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
+            auto rows0                  = mod_rows(ctx, modulation[0], prefix_length);
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
-            h                           = modulate(ctx->ggml_ctx, h, modulation[0], prefix_length);
+            h                           = modulate(ctx->ggml_ctx, h, rows0, prefix_length);
             h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache);
-            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length, true));
+            auto rows1                  = mod_rows(ctx, modulation[1], prefix_length, true);
+            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, rows1, prefix_length));
+            auto rows2                  = mod_rows(ctx, modulation[2], prefix_length);
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
-            h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
-            ggml_tensor* gate;
+            h                           = modulate(ctx->ggml_ctx, h, rows2, prefix_length);
             auto fused = blocks.find("img_mlp.gate_up");
             if (fused != blocks.end()) {
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
-                auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
-                gate         = parts[0];
-                h            = parts[1];
+                // silu(first half) * second half straight from gate_up, without copying both halves out first
+                h = ggml_swiglu(ctx->ggml_ctx, gate_up);
             } else {
-                gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
-                h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                h         = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
+                h         = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             }
-            h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
-            return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length, true));
+            return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, mod_rows(ctx, modulation[3], prefix_length, true), prefix_length));
         }
     };
 
