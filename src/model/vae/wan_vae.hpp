@@ -81,6 +81,24 @@ namespace WAN {
             int lp2 = 2 * std::get<0>(padding);
             int rp2 = 0;
 
+            if (cache_x == nullptr && w->ne[2] > 1 && x->ne[2] == 1 && x->ne[3] == in_channels &&
+                lp2 == w->ne[2] - 1 && std::get<0>(stride) == 1 && std::get<0>(dilation) == 1 &&
+                !ctx->circular_x_enabled && !ctx->circular_y_enabled) {
+                // The padded frames are zeros, so one frame sees only the kernel's last temporal tap: a 2D conv.
+                ggml_tensor* w2 = ggml_view_4d(ctx->ggml_ctx, w, w->ne[0], w->ne[1], 1, w->ne[3],
+                                               w->nb[1], w->nb[2], w->nb[3], (w->ne[2] - 1) * w->nb[2]);
+                w2              = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, w2), w->ne[0], w->ne[1], in_channels, out_channels);
+                if (!ggml_is_contiguous(x)) {
+                    x = ggml_cont(ctx->ggml_ctx, x);
+                }
+                ggml_tensor* x2 = ggml_reshape_4d(ctx->ggml_ctx, x, x->ne[0], x->ne[1], in_channels, 1);
+                x2              = ggml_ext_conv_2d(ctx->ggml_ctx, x2, w2, b,
+                                                   std::get<2>(stride), std::get<1>(stride), lp0, lp1,
+                                                   std::get<2>(dilation), std::get<1>(dilation),
+                                                   ctx->conv2d_direct_enabled, false, false, scale);
+                return ggml_reshape_4d(ctx->ggml_ctx, x2, x2->ne[0], x2->ne[1], 1, out_channels);
+            }
+
             if (cache_x != nullptr && lp2 > 0) {
                 x = ggml_concat(ctx->ggml_ctx, cache_x, x, 2);
                 lp2 -= (int)cache_x->ne[2];
