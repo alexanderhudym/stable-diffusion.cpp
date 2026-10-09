@@ -1007,6 +1007,16 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
         }
     }
 
+    for (const auto& [key, value] : parse_key_value_args(sd_ctx_params->model_args, "model arg")) {
+        if (key == "te_params" && value == "disk") {
+            if (!params_backend_spec.empty()) {
+                params_backend_spec += ",";
+            }
+            params_backend_spec += "te=disk";
+            LOG_INFO("te_params=disk: text encoder weights are read for each encode and freed after it");
+        }
+    }
+
     if (!init_backend()) {
         return false;
     }
