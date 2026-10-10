@@ -937,13 +937,25 @@ public:
         if (!elementwise_affine) {
             return ggml_rms_norm(ctx->ggml_ctx, x, eps);
         }
+        ggml_tensor* w = weight(ctx);
+        x              = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+        x              = ggml_mul_inplace(ctx->ggml_ctx, x, w);
+        return x;
+    }
+
+    float get_eps() const {
+        return eps;
+    }
+
+    ggml_tensor* weight(GGMLRunnerContext* ctx) {
+        if (!elementwise_affine) {
+            return nullptr;
+        }
         ggml_tensor* w = params["weight"];
         if (ctx->weight_adapter) {
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
         }
-        x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
-        x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
-        return x;
+        return w;
     }
 
     // forward() followed by Rope::apply_rope(x, pe, interleaved) as one op (bit-identical), for x [D, heads, tokens, N];
@@ -953,14 +965,8 @@ public:
         if (ctx->backend == nullptr || !ggml_is_contiguous(x) || x->type != GGML_TYPE_F32) {
             return nullptr;
         }
-        ggml_tensor* w = nullptr;
-        if (elementwise_affine) {
-            w = params["weight"];
-            if (ctx->weight_adapter) {
-                w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
-            }
-        }
-        auto out = ggml_rms_norm_rope_pe(ctx->ggml_ctx, x, w, pe, eps);
+        ggml_tensor* w = weight(ctx);
+        auto out       = ggml_rms_norm_rope_pe(ctx->ggml_ctx, x, w, pe, eps);
         return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
 #else
         return nullptr;

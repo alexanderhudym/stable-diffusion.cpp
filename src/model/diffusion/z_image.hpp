@@ -243,7 +243,7 @@ namespace ZImage {
                 auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
 
                 if (pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe) && pe->ne[0] == 2 && pe->ne[1] == 2 &&
-                    pe->ne[2] == head_dim / 2 && pe->ne[3] == n_token) {
+                    head_dim % 2 == 0 && pe->ne[2] == head_dim / 2 && pe->ne[3] == n_token) {
                     auto q_rope = q_norm->forward_rope_pe(ctx, ggml_cont(ctx->ggml_ctx, q), pe);
                     auto k_rope = q_rope != nullptr ? k_norm->forward_rope_pe(ctx, ggml_cont(ctx->ggml_ctx, k), pe) : nullptr;
                     if (k_rope != nullptr) {
@@ -367,6 +367,33 @@ namespace ZImage {
                 auto gate_msa  = mods[1];
                 auto scale_mlp = mods[2];
                 auto gate_mlp  = mods[3];
+
+                if (scale_msa->ne[1] != x->ne[1]) {
+                    auto g      = ctx->ggml_ctx;
+                    auto folded = [&](const std::shared_ptr<RMSNorm>& norm, ggml_tensor* v) {
+                        auto w = norm->weight(ctx);
+                        v      = w != nullptr ? ggml_mul(g, v, w) : v;
+                        v      = ggml_reshape_3d(g, v, v->ne[0], 1, v->ne[1]);
+                        ctx->expand_graph(v);
+                        return v;
+                    };
+                    auto v_msa  = folded(attention_norm1, ggml_scale_bias(g, scale_msa, 1.f, 1.f));
+                    auto v_gmsa = folded(attention_norm2, ggml_tanh(g, gate_msa));
+
+                    auto residual = x;
+                    x             = ggml_mul(g, ggml_rms_norm(g, x, attention_norm1->get_eps()), v_msa);
+                    x             = attention->forward(ctx, x, pe, mask);
+                    x             = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, attention_norm2->get_eps()), v_gmsa), residual);
+
+                    auto v_mlp  = folded(ffn_norm1, ggml_scale_bias(g, scale_mlp, 1.f, 1.f));
+                    auto v_gmlp = folded(ffn_norm2, ggml_tanh(g, gate_mlp));
+
+                    residual = x;
+                    x        = ggml_mul(g, ggml_rms_norm(g, x, ffn_norm1->get_eps()), v_mlp);
+                    x        = feed_forward->forward(ctx, x);
+                    x        = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, ffn_norm2->get_eps()), v_gmlp), residual);
+                    return x;
+                }
 
                 auto residual = x;
                 x             = modulate(ctx->ggml_ctx, attention_norm1->forward(ctx, x), scale_msa);
@@ -673,7 +700,7 @@ namespace ZImage {
             // print_ggml_tensor(pe, true, "pe");
             // pe->data = nullptr;
             set_backend_tensor_data(pe, pe_vec.data());
-            auto runner_ctx = get_context();
+            auto runner_ctx = get_context(gf);
 
             ggml_tensor* out = z_image.forward(&runner_ctx,
                                                x,

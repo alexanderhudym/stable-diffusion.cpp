@@ -181,14 +181,22 @@ namespace Krea2 {
             : hidden_size(hidden_size),
               eps(eps) {}
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        float get_eps() const {
+            return eps;
+        }
+
+        ggml_tensor* weight_plus_one(GGMLRunnerContext* ctx) {
             ggml_tensor* scale = params["scale"];
             if (ctx->weight_adapter) {
                 scale = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, scale, prefix + "scale.weight");
             }
-            scale = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
-            x     = ggml_rms_norm(ctx->ggml_ctx, x, eps);
-            x     = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
+            return ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            ggml_tensor* scale = weight_plus_one(ctx);
+            x                  = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+            x                  = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
             return x;
         }
 
@@ -199,11 +207,7 @@ namespace Krea2 {
                 pe->ne[2] != x->ne[0] / 2 || pe->ne[3] != x->ne[2]) {
                 return nullptr;
             }
-            ggml_tensor* scale = params["scale"];
-            if (ctx->weight_adapter) {
-                scale = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, scale, prefix + "scale.weight");
-            }
-            scale = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
+            ggml_tensor* scale = weight_plus_one(ctx);
             if (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != x->ne[0]) {
                 return nullptr;
             }
@@ -229,10 +233,9 @@ namespace Krea2 {
             auto up   = std::dynamic_pointer_cast<Linear>(blocks["up"]);
             auto down = std::dynamic_pointer_cast<Linear>(blocks["down"]);
 
-            auto gated = ggml_silu(ctx->ggml_ctx, gate->forward(ctx, x));
-            auto up_x  = up->forward(ctx, x);
-            x          = ggml_mul(ctx->ggml_ctx, gated, up_x);
-            return down->forward(ctx, x);
+            auto gate_x = gate->forward(ctx, x);
+            auto up_x   = up->forward(ctx, x);
+            return down->forward(ctx, ggml_swiglu_split(ctx->ggml_ctx, gate_x, up_x));
         }
     };
 
@@ -532,22 +535,23 @@ namespace Krea2 {
                 auto mlp_res = ggml_concat(ctx->ggml_ctx, mlp_res_main, mlp_res_refs, 1);
                 x            = ggml_add(ctx->ggml_ctx, x, mlp_res);
             } else {
-                auto mods       = mod->forward(ctx, vec);
-                auto attn_input = Flux::modulate(ctx->ggml_ctx,
-                                                 prenorm->forward(ctx, x),
-                                                 mods[1],
-                                                 mods[0],
-                                                 true);
+                auto g      = ctx->ggml_ctx;
+                auto mods   = mod->forward(ctx, vec);
+                auto folded = [&](const std::shared_ptr<KreaRMSNorm>& norm, ggml_tensor* scale, ggml_tensor* shift) {
+                    auto v = ggml_mul(g, ggml_scale_bias(g, scale, 1.f, 1.f), norm->weight_plus_one(ctx));
+                    ctx->expand_graph(v);
+                    ctx->expand_graph(shift);
+                    return v;
+                };
+                auto v_pre      = folded(prenorm, mods[0], mods[1]);
+                auto attn_input = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, prenorm->get_eps()), v_pre), mods[1]);
                 auto attn_out   = attn->forward(ctx, attn_input, pe);
-                x               = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, mods[2]));
+                x               = ggml_add(g, x, ggml_mul(g, attn_out, mods[2]));
 
-                auto mlp_input = Flux::modulate(ctx->ggml_ctx,
-                                                postnorm->forward(ctx, x),
-                                                mods[4],
-                                                mods[3],
-                                                true);
+                auto v_post    = folded(postnorm, mods[3], mods[4]);
+                auto mlp_input = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, postnorm->get_eps()), v_post), mods[4]);
                 auto mlp_out   = mlp->forward(ctx, mlp_input);
-                x              = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, mlp_out, mods[5]));
+                x              = ggml_add(g, x, ggml_mul(g, mlp_out, mods[5]));
             }
             return x;
         }
@@ -798,7 +802,7 @@ namespace Krea2 {
             auto pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
             set_backend_tensor_data(pe, pe_vec.data());
 
-            auto runner_ctx  = get_context();
+            auto runner_ctx  = get_context(gf);
             ggml_tensor* out = model.forward(&runner_ctx, x, timesteps, context, pe, ref_latents, ref_image_params.force_ref_timestep_zero);
             ggml_build_forward_expand(gf, out);
             return gf;
