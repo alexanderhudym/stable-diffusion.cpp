@@ -191,6 +191,28 @@ namespace Krea2 {
             x     = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
             return x;
         }
+
+        ggml_tensor* forward_rope_pe(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+#ifndef SD_USE_UPSTREAM_GGML
+            if (ctx->backend == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] % 2 != 0 ||
+                pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe) || pe->ne[0] != 2 || pe->ne[1] != 2 ||
+                pe->ne[2] != x->ne[0] / 2 || pe->ne[3] != x->ne[2]) {
+                return nullptr;
+            }
+            ggml_tensor* scale = params["scale"];
+            if (ctx->weight_adapter) {
+                scale = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, scale, prefix + "scale.weight");
+            }
+            scale = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
+            if (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != x->ne[0]) {
+                return nullptr;
+            }
+            auto out = ggml_rms_norm_rope_pe(ctx->ggml_ctx, x, scale, pe, eps);
+            return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+#else
+            return nullptr;
+#endif
+        }
     };
 
     class KreaSwiGLU : public UnaryBlock {
@@ -286,13 +308,22 @@ namespace Krea2 {
             auto v = wv->forward(ctx, x);
             v      = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim_, kv_heads, L, N);
 
-            q = qnorm->forward(ctx, q);
-            k = knorm->forward(ctx, k);
-
-            auto out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
-                                     : attention_no_rope(ctx, q, k, v, mask);
-            out      = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
-            out      = wo->forward(ctx, out);
+            ggml_tensor* out = nullptr;
+            if (pe != nullptr) {
+                auto q_rope = qnorm->forward_rope_pe(ctx, q, pe);
+                auto k_rope = q_rope != nullptr ? knorm->forward_rope_pe(ctx, k, pe) : nullptr;
+                if (k_rope != nullptr) {
+                    out = ggml_ext_attention_ext(ctx, q_rope, k_rope, v, heads, mask, true, ctx->flash_attn_enabled, 1.f);
+                }
+            }
+            if (out == nullptr) {
+                q   = qnorm->forward(ctx, q);
+                k   = knorm->forward(ctx, k);
+                out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
+                                    : attention_no_rope(ctx, q, k, v, mask);
+            }
+            out = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
+            out = wo->forward(ctx, out);
             return out;
         }
     };

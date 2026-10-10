@@ -242,6 +242,16 @@ namespace ZImage {
                 auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
                 auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
 
+                if (pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe) && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+                    pe->ne[2] == head_dim / 2 && pe->ne[3] == n_token) {
+                    auto q_rope = q_norm->forward_rope_pe(ctx, ggml_cont(ctx->ggml_ctx, q), pe);
+                    auto k_rope = q_rope != nullptr ? k_norm->forward_rope_pe(ctx, ggml_cont(ctx->ggml_ctx, k), pe) : nullptr;
+                    if (k_rope != nullptr) {
+                        x = ggml_ext_attention_ext(ctx, q_rope, k_rope, v, num_heads, mask, true, ctx->flash_attn_enabled, 1.f / 128.f);
+                        return out_proj->forward(ctx, x);
+                    }
+                }
+
                 q = q_norm->forward(ctx, q);
                 k = k_norm->forward(ctx, k);
             }
