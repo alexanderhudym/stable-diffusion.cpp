@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -666,7 +667,9 @@ namespace Krea2 {
                              ggml_tensor* context,
                              ggml_tensor* pe,
                              std::vector<ggml_tensor*> ref_latents = {},
-                             bool zero_timestep_refs               = false) {
+                             bool zero_timestep_refs               = false,
+                             ggml_tensor* txt_cached               = nullptr,
+                             const char* txt_cache_name            = nullptr) {
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
             int64_t N = x->ne[3];
@@ -705,8 +708,18 @@ namespace Krea2 {
                 tvec_0          = tproj->forward(ctx, t_0);
             }
 
-            auto txt        = txtfusion->forward(ctx, context);
-            txt             = txtmlp->forward(ctx, txt);
+            ggml_tensor* txt = txt_cached;
+            if (txt == nullptr) {
+                txt = txtfusion->forward(ctx, context);
+                txt = txtmlp->forward(ctx, txt);
+                if (txt->view_src != nullptr) {
+                    txt = ggml_cont(ctx->ggml_ctx, txt);
+                }
+                sd::ggml_graph_cut::mark_graph_cut(txt, "krea2.txt", "txt");
+                if (txt_cache_name != nullptr) {
+                    ctx->persist_cache_tensor(txt_cache_name, txt);
+                }
+            }
             int64_t txt_len = txt->ne[1];
 
             auto hidden_states = ggml_concat(ctx->ggml_ctx, txt, img, 1);
@@ -752,6 +765,7 @@ namespace Krea2 {
         Krea2Config config;
         Krea2Model model;
         std::vector<float> pe_vec;
+        std::vector<float> txt_keys[2];
 
         Krea2Runner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -775,13 +789,15 @@ namespace Krea2 {
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const sd::Tensor<float>& context_tensor,
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
-                                 const RefImageParams& ref_image_params                   = REF_IMAGE_PRESETS.at("krea2_ostris_edit")) {
+                                 const RefImageParams& ref_image_params                   = REF_IMAGE_PRESETS.at("krea2_ostris_edit"),
+                                 ggml_tensor* txt_cached                                  = nullptr,
+                                 const char* txt_cache_name                               = nullptr) {
             ggml_cgraph* gf        = new_graph_custom(KREA2_GRAPH_SIZE);
             ggml_tensor* x         = make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             GGML_ASSERT(x->ne[3] == 1);
             GGML_ASSERT(!context_tensor.empty());
-            ggml_tensor* context = make_input(context_tensor);
+            ggml_tensor* context = txt_cached == nullptr ? make_input(context_tensor) : nullptr;
 
             std::vector<ggml_tensor*> ref_latents;
             ref_latents.reserve(ref_latents_tensor.size());
@@ -793,7 +809,7 @@ namespace Krea2 {
                                                       static_cast<int>(x->ne[0]),
                                                       config.patch_size,
                                                       static_cast<int>(x->ne[3]),
-                                                      static_cast<int>(context->ne[1]),
+                                                      static_cast<int>(txt_cached != nullptr ? txt_cached->ne[1] : context->ne[1]),
                                                       config.theta,
                                                       config.axes_dim,
                                                       ref_latents,
@@ -803,7 +819,7 @@ namespace Krea2 {
             set_backend_tensor_data(pe, pe_vec.data());
 
             auto runner_ctx  = get_context(gf);
-            ggml_tensor* out = model.forward(&runner_ctx, x, timesteps, context, pe, ref_latents, ref_image_params.force_ref_timestep_zero);
+            ggml_tensor* out = model.forward(&runner_ctx, x, timesteps, context, pe, ref_latents, ref_image_params.force_ref_timestep_zero, txt_cached, txt_cache_name);
             ggml_build_forward_expand(gf, out);
             return gf;
         }
@@ -814,10 +830,31 @@ namespace Krea2 {
                                   const sd::Tensor<float>& context,
                                   const std::vector<sd::Tensor<float>>& ref_latents = {},
                                   const RefImageParams& ref_image_params            = REF_IMAGE_PRESETS.at("krea2_ostris_edit")) {
-            auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, ref_latents, ref_image_params);
+            static const char* const names[2] = {"krea2.txt.0", "krea2.txt.1"};
+            ggml_tensor* txt_cached           = nullptr;
+            int target                        = -1;
+            for (int i = 0; i < 2; ++i) {
+                ggml_tensor* cached = txt_keys[i].empty() ? nullptr : get_cache_tensor_by_name(names[i]);
+                if (cached == nullptr) {
+                    target = target < 0 ? i : target;
+                } else if (txt_cached == nullptr && txt_keys[i].size() == static_cast<size_t>(context.numel()) &&
+                           std::memcmp(txt_keys[i].data(), context.data(), txt_keys[i].size() * sizeof(float)) == 0) {
+                    txt_cached = cached;
+                }
+            }
+            const char* txt_cache_name = txt_cached == nullptr && target >= 0 ? names[target] : nullptr;
+            auto get_graph             = [&]() -> ggml_cgraph* {
+                return build_graph(x, timesteps, context, ref_latents, ref_image_params, txt_cached, txt_cache_name);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
+            auto result = GGMLRunner::compute(get_graph, n_threads, false);
+            if (txt_cache_name != nullptr) {
+                if (result.has_value() && get_cache_tensor_by_name(txt_cache_name) != nullptr) {
+                    txt_keys[target].assign(context.data(), context.data() + context.numel());
+                } else {
+                    txt_keys[target].clear();
+                }
+            }
+            return restore_trailing_singleton_dims(std::move(result), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,

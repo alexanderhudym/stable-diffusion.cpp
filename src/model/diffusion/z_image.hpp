@@ -276,12 +276,13 @@ namespace ZImage {
             blocks["w1"] = std::make_shared<Linear>(dim, hidden_dim, false);
 
             bool force_prec_f32 = false;
-            float scale         = 1.f / 128.f;
 
-            // The purpose of the scale here is to prevent NaN issues in certain situations.
-            // For example, when using CUDA but the weights are k-quants.
-            blocks["w2"] = std::make_shared<Linear>(hidden_dim, dim, false, false, force_prec_f32, scale);
+            blocks["w2"] = std::make_shared<Linear>(hidden_dim, dim, false, false, force_prec_f32, 1.f);
             blocks["w3"] = std::make_shared<Linear>(dim, hidden_dim, false);
+        }
+
+        float out_scale(GGMLRunnerContext* ctx) const {
+            return ctx->linear_scale <= 0.f ? 1.f / 128.f : 1.f;
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -296,7 +297,10 @@ namespace ZImage {
             auto x1 = w1->forward(ctx, x);
             auto x3 = w3->forward(ctx, x);
             x       = ggml_swiglu_split(ctx->ggml_ctx, x1, x3);
-            x       = w2->forward(ctx, x);
+            if (out_scale(ctx) != 1.f) {
+                x = ggml_ext_scale(ctx->ggml_ctx, x, out_scale(ctx));
+            }
+            x = w2->forward(ctx, x);
 
             return x;
         }
@@ -345,6 +349,16 @@ namespace ZImage {
             }
         }
 
+        ggml_tensor* ffn_norm2_forward(GGMLRunnerContext* ctx, ggml_tensor* x, float s) {
+            auto ffn_norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["ffn_norm2"]);
+            if (s == 1.f) {
+                return ffn_norm2->forward(ctx, x);
+            }
+            ggml_tensor* w = ffn_norm2->weight(ctx);
+            x              = ggml_rms_norm(ctx->ggml_ctx, x, ffn_norm2->get_eps() * s * s);
+            return w != nullptr ? ggml_mul_inplace(ctx->ggml_ctx, x, w) : x;
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* pe,
@@ -356,6 +370,7 @@ namespace ZImage {
             auto ffn_norm1       = std::dynamic_pointer_cast<RMSNorm>(blocks["ffn_norm1"]);
             auto attention_norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["attention_norm2"]);
             auto ffn_norm2       = std::dynamic_pointer_cast<RMSNorm>(blocks["ffn_norm2"]);
+            const float s        = feed_forward->out_scale(ctx);
 
             if (modulation) {
                 GGML_ASSERT(adaln_input != nullptr);
@@ -391,7 +406,7 @@ namespace ZImage {
                     residual = x;
                     x        = ggml_mul(g, ggml_rms_norm(g, x, ffn_norm1->get_eps()), v_mlp);
                     x        = feed_forward->forward(ctx, x);
-                    x        = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, ffn_norm2->get_eps()), v_gmlp), residual);
+                    x        = ggml_add(g, ggml_mul(g, ggml_rms_norm(g, x, ffn_norm2->get_eps() * s * s), v_gmlp), residual);
                     return x;
                 }
 
@@ -405,7 +420,7 @@ namespace ZImage {
                 residual = x;
                 x        = modulate(ctx->ggml_ctx, ffn_norm1->forward(ctx, x), scale_mlp);
                 x        = feed_forward->forward(ctx, x);
-                x        = ffn_norm2->forward(ctx, x);
+                x        = ffn_norm2_forward(ctx, x, s);
                 x        = ggml_mul(ctx->ggml_ctx, x, ggml_tanh(ctx->ggml_ctx, gate_mlp));
                 x        = ggml_add(ctx->ggml_ctx, x, residual);
             } else {
@@ -420,7 +435,7 @@ namespace ZImage {
                 residual = x;
                 x        = ffn_norm1->forward(ctx, x);
                 x        = feed_forward->forward(ctx, x);
-                x        = ffn_norm2->forward(ctx, x);
+                x        = ffn_norm2_forward(ctx, x, s);
                 x        = ggml_add(ctx->ggml_ctx, x, residual);
             }
 
