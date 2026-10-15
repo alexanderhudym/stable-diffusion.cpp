@@ -477,6 +477,8 @@ public:
 
     sd::Tensor<float> encode_to_vae_latents(const sd::Tensor<float>& x);
 
+    sd::Tensor<float> vae_in_tiles(const sd::Tensor<float>& x, bool decode);
+
     sd::Tensor<float> encode_first_stage(const sd::Tensor<float>& x);
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false);

@@ -17,14 +17,18 @@ struct TileSpan {
 static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
                                                  int tile_size,
                                                  float target_overlap,
-                                                 bool circular) {
+                                                 bool circular,
+                                                 int tile_count = 0) {
     if (tile_size >= dimension) {
         return {{0, 0, 0}};
     }
 
     const int extent = circular ? dimension : dimension - tile_size;
     int intervals    = extent;
-    if (tile_size > 1) {
+    if (tile_count > 1 && !circular) {
+        // An explicit count: the caller has checked that neighbours overlap and that no point lies in three tiles.
+        intervals = tile_count - 1;
+    } else if (tile_size > 1) {
         const float target = extent / ((1.0f - target_overlap) * tile_size);
         // Adjacent tiles must overlap, but three tiles must not cover the same point.
         const int min_intervals = 1 + (extent - 1) / (tile_size - 1);
@@ -146,7 +150,9 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
                                    bool circular_x,
                                    bool circular_y,
                                    const TileProcessCallback& on_processing,
-                                   bool silent) {
+                                   bool silent,
+                                   int tiles_x_count,
+                                   int tiles_y_count) {
     sd::Tensor<float> output;
     int input_width  = static_cast<int>(input.shape()[0]);
     int input_height = static_cast<int>(input.shape()[1]);
@@ -162,8 +168,8 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
     int scale_in     = decode ? 1 : scale;
     int scale_out    = decode ? scale : 1;
 
-    const auto tiles_x = sd_tiling_plan_axis(small_width, p_tile_size_w, tile_overlap_factor, circular_x);
-    const auto tiles_y = sd_tiling_plan_axis(small_height, p_tile_size_h, tile_overlap_factor, circular_y);
+    const auto tiles_x = sd_tiling_plan_axis(small_width, p_tile_size_w, tile_overlap_factor, circular_x, tiles_x_count);
+    const auto tiles_y = sd_tiling_plan_axis(small_height, p_tile_size_h, tile_overlap_factor, circular_y, tiles_y_count);
 
     int tile_width         = std::min(p_tile_size_w, small_width);
     int tile_height        = std::min(p_tile_size_h, small_height);

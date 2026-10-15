@@ -860,7 +860,11 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
         return fits(requests, params);
     };
-    auto manager         = residency_manager.lock();
+    auto manager = residency_manager.lock();
+    if (fit_query_) {
+        fit_query_fits_ = manager == nullptr || fits_monolithic();
+        return sd::Tensor<float>();
+    }
     const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
                            cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1 &&

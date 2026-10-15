@@ -171,6 +171,10 @@ protected:
     size_t compute_ctx_buffer_size_ = 0;
     bool runner_started_      = false;
     bool graph_active_        = false;
+    // Set by a caller that only asks whether the next graph fits: execute_graph stores the answer in
+    // fit_query_fits_ and returns an empty tensor before it prepares, allocates or evicts anything.
+    bool fit_query_      = false;
+    bool fit_query_fits_ = false;
 
     size_t max_graph_vram_bytes        = 0;
     bool graph_cut_layer_split_enabled = false;

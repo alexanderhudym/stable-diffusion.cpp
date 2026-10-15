@@ -10,6 +10,14 @@
 #include "model_manager.h"
 #include "runtime/tiling.h"
 
+// An explicit tile layout in latent pixels; nx == 0 means none.
+struct VAETileGrid {
+    int nx     = 0;
+    int ny     = 0;
+    int tile_w = 0;
+    int tile_h = 0;
+};
+
 struct VAE : public GGMLRunner {
 protected:
     SDVersion version;
@@ -128,7 +136,8 @@ protected:
                                     bool decode_graph,
                                     const sd_tiling_params_t& tiling_params,
                                     const char* error_message,
-                                    bool silent = false) {
+                                    bool silent             = false,
+                                    const VAETileGrid& grid = {}) {
         auto on_processing = [&](const sd::Tensor<float>& input_tile) {
             auto output_tile = compute_with_temporal_tiling(
                 n_threads,
@@ -160,7 +169,9 @@ protected:
                                          circular_x && p_tile_size_w < latent_width,
                                          circular_y && p_tile_size_h < latent_height,
                                          on_processing,
-                                         silent);
+                                         silent,
+                                         grid.nx,
+                                         grid.ny);
         set_circular_axes(original_circular_x, original_circular_y);
         return output;
     }
@@ -258,7 +269,8 @@ public:
                              sd_tiling_params_t tiling_params,
                              bool circular_x,
                              bool circular_y,
-                             bool auto_end) {
+                             bool auto_end,
+                             const VAETileGrid& grid = {}) {
         int64_t t0              = ggml_time_ms();
         tiling_params           = resolve_tiling_params(tiling_params);
         sd::Tensor<float> input = x;
@@ -267,13 +279,17 @@ public:
             scale_tensor_to_minus1_1(&input);
         }
 
-        if (tiling_params.enabled) {
+        if (tiling_params.enabled || grid.nx > 0) {
             const int scale_factor = get_scale_factor();
             int64_t W              = input.shape()[0] / scale_factor;
             int64_t H              = input.shape()[1] / scale_factor;
             float tile_overlap;
             int tile_size_w, tile_size_h;
-            if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params, W, H)) {
+            if (grid.nx > 0) {
+                tile_size_w  = grid.tile_w;
+                tile_size_h  = grid.tile_h;
+                tile_overlap = 0.5f;
+            } else if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params, W, H)) {
                 return {};
             }
             LOG_VERBOSE("VAE encode tile size: %dx%d pixels (%dx%d latent)",
@@ -290,7 +306,9 @@ public:
                                    circular_y,
                                    false,
                                    tiling_params,
-                                   "vae encode compute failed while processing a tile");
+                                   "vae encode compute failed while processing a tile",
+                                   false,
+                                   grid);
         } else {
             output = compute_with_temporal_tiling(n_threads,
                                                   input,
@@ -328,19 +346,24 @@ public:
                              bool circular_x,
                              bool circular_y,
                              bool silent,
-                             bool auto_end) {
+                             bool auto_end,
+                             const VAETileGrid& grid = {}) {
         int64_t t0              = ggml_time_ms();
         tiling_params           = resolve_tiling_params(tiling_params);
         sd::Tensor<float> input = x;
         sd::Tensor<float> output;
 
-        if (tiling_params.enabled) {
+        if (tiling_params.enabled || grid.nx > 0) {
             const int scale_factor = get_scale_factor();
             int64_t W              = input.shape()[0] * scale_factor;
             int64_t H              = input.shape()[1] * scale_factor;
             float tile_overlap;
             int tile_size_w, tile_size_h;
-            if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params, input.shape()[0], input.shape()[1])) {
+            if (grid.nx > 0) {
+                tile_size_w  = grid.tile_w;
+                tile_size_h  = grid.tile_h;
+                tile_overlap = 0.5f;
+            } else if (!get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params, input.shape()[0], input.shape()[1])) {
                 return {};
             }
             if (!silent) {
@@ -361,7 +384,8 @@ public:
                 true,
                 tiling_params,
                 "vae decode compute failed while processing a tile",
-                silent);
+                silent,
+                grid);
         } else {
             output = compute_with_temporal_tiling(n_threads,
                                                   input,
@@ -383,6 +407,16 @@ public:
         int64_t t1 = ggml_time_ms();
         LOG_VERBOSE("computing vae decode graph completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
         return std::move(output);
+    }
+
+    // Whether the graph for `probe` (one tile's input) fits the memory left; measures only, allocates and evicts nothing.
+    bool fits_tile(int n_threads, const sd::Tensor<float>& probe, bool decode_graph) {
+        fit_query_      = true;
+        fit_query_fits_ = false;
+        _compute(n_threads, probe, decode_graph);
+        fit_query_ = false;
+        runner_end();
+        return fit_query_fits_;
     }
 
     virtual sd::Tensor<float> vae_output_to_latents(const sd::Tensor<float>& vae_output, std::shared_ptr<RNG> rng) = 0;

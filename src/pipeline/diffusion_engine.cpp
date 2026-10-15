@@ -2991,8 +2991,114 @@ int StableDiffusionGGML::align_video_frames(int frames) {
     return latent_frames_to_video_frames(video_frames_to_latent_frames(frames));
 }
 
+namespace {
+    struct VaeTileLayout {
+        int nx, ny, sx, sy;  // tile counts and tile sides in latent pixels
+    };
+
+    // Tile side for n tiles over l latent pixels, neighbours overlapping by `overlap`.
+    int vae_tile_side(int l, int n, int overlap) {
+        return n == 1 ? l : (l + (n - 1) * overlap + n - 1) / n;
+    }
+
+    // The counts worth trying on one axis: n tiles no smaller than min_side, none sharing a point with two others.
+    std::vector<int> vae_axis_counts(int l, int min_side, int overlap) {
+        std::vector<int> counts = {1};
+        for (int n = 2; l > min_side; ++n) {
+            const int s = vae_tile_side(l, n, overlap);
+            if (s < min_side || s >= l) {
+                break;
+            }
+            bool apart = true;
+            for (int i = 1; i < n; ++i) {
+                const int gap = static_cast<int>(int64_t(i) * (l - s) / (n - 1) - int64_t(i - 1) * (l - s) / (n - 1));
+                apart         = apart && gap >= (s + 1) / 2;
+            }
+            if (apart) {
+                counts.push_back(n);
+            }
+        }
+        return counts;
+    }
+
+    std::vector<VaeTileLayout> vae_tile_layouts(int lx, int ly, int scale) {
+        const int overlap  = 128 / scale;
+        const int min_side = 256 / scale;
+        std::vector<VaeTileLayout> layouts;
+        for (int nx : vae_axis_counts(lx, min_side, overlap)) {
+            for (int ny : vae_axis_counts(ly, min_side, overlap)) {
+                if (nx * ny >= 2) {
+                    layouts.push_back({nx, ny, vae_tile_side(lx, nx, overlap), vae_tile_side(ly, ny, overlap)});
+                }
+            }
+        }
+        std::stable_sort(layouts.begin(), layouts.end(), [&](const VaeTileLayout& a, const VaeTileLayout& b) {
+            if (a.nx * a.ny != b.nx * b.ny) {
+                return a.nx * a.ny < b.nx * b.ny;
+            }
+            if (int64_t(a.sx) * a.sy != int64_t(b.sx) * b.sy) {
+                return int64_t(a.sx) * a.sy < int64_t(b.sx) * b.sy;
+            }
+            return lx >= ly ? a.nx > b.nx : a.ny > b.ny;
+        });
+        return layouts;
+    }
+}  // namespace
+
+// Callers try the whole image first: that run evicts what it may and is refused only when the device cannot give it
+// the memory, so a request tiles exactly when it could not run whole, and the fit queries below see the most memory
+// the device can give. The fewest tiles whose graph fits go first; a refused run takes the next smaller area.
+sd::Tensor<float> StableDiffusionGGML::vae_in_tiles(const sd::Tensor<float>& x, bool decode) {
+    const int scale    = first_stage_model->get_scale_factor();
+    const int lx       = static_cast<int>(decode ? x.shape()[0] : x.shape()[0] / scale);
+    const int ly       = static_cast<int>(decode ? x.shape()[1] : x.shape()[1] / scale);
+    const auto layouts = vae_tile_layouts(lx, ly, scale);
+    auto area          = [&](const VaeTileLayout& l) { return int64_t(l.sx) * l.sy; };
+
+    size_t chosen  = 0;
+    int64_t failed = int64_t(lx) * ly;
+    for (size_t i = 0; i < layouts.size(); ++i) {
+        if (area(layouts[i]) >= failed) {
+            continue;
+        }
+        auto shape = x.shape();
+        shape[0]   = layouts[i].sx * (decode ? 1 : scale);
+        shape[1]   = layouts[i].sy * (decode ? 1 : scale);
+        if (first_stage_model->fits_tile(n_threads, sd::Tensor<float>::zeros(std::move(shape)), decode)) {
+            chosen = i;
+            break;
+        }
+        failed = area(layouts[i]);
+    }
+
+    failed = int64_t(lx) * ly;
+    for (size_t i = chosen; i < layouts.size(); ++i) {
+        const auto& l = layouts[i];
+        if (area(l) >= failed) {
+            continue;
+        }
+        const VAETileGrid grid = {l.nx, l.ny, l.sx, l.sy};
+        auto result            = decode ? first_stage_model->decode(n_threads, x, vae_tiling_params, false, circular_x, circular_y, false, true, grid)
+                                          : first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y, true, grid);
+        if (!result.empty()) {
+            LOG_INFO("VAE %s in %dx%d tiles of %dx%d px", decode ? "decode" : "encode",
+                     l.nx, l.ny, l.sx * scale, l.sy * scale);
+            return result;
+        }
+        if (first_stage_model->last_compute_status() != GGML_STATUS_ALLOC_FAILED) {
+            break;
+        }
+        failed = area(l);
+    }
+    return {};
+}
+
 sd::Tensor<float> StableDiffusionGGML::encode_to_vae_latents(const sd::Tensor<float>& x) {
     auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
+    if (latents.empty() && !first_stage_model->resolve_tiling_params(vae_tiling_params).enabled &&
+        first_stage_model->last_compute_status() == GGML_STATUS_ALLOC_FAILED) {
+        latents = vae_in_tiles(x, false);
+    }
     if (latents.empty()) {
         return {};
     }
@@ -3019,6 +3125,13 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
     const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
                                         first_stage_model->can_temporal_tile_decode();
+    if (!decode_video && !tiling_params.enabled) {
+        auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, false, circular_x, circular_y);
+        if (!decoded.empty() || first_stage_model->last_compute_status() != GGML_STATUS_ALLOC_FAILED) {
+            return decoded;
+        }
+        return vae_in_tiles(latents, true);
+    }
     for (;;) {
         int tile_size_w = static_cast<int>(latents.shape()[0]);
         int tile_size_h = static_cast<int>(latents.shape()[1]);

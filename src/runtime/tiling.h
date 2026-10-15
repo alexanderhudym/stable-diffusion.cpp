@@ -17,6 +17,8 @@ sd::Tensor<float> process_tiles_2d(const sd::Tensor<float>& input,
                                    bool circular_x,
                                    bool circular_y,
                                    const TileProcessCallback& on_processing,
-                                   bool silent = false);
+                                   bool silent       = false,
+                                   int tiles_x_count = 0,
+                                   int tiles_y_count = 0);
 
 #endif  // __SD_RUNTIME_TILING_H__
